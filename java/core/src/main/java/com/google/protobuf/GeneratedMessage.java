@@ -128,8 +128,9 @@ public abstract class GeneratedMessage extends AbstractMessage implements Serial
    * @param getBytesForString whether to generate ByteString for string fields
    */
   private Map<FieldDescriptor, Object> getAllFieldsMutable(boolean getBytesForString) {
-    final TreeMap<FieldDescriptor, Object> result = new TreeMap<>();
     final FieldAccessorTable fieldAccessorTable = internalGetFieldAccessorTable();
+    final SmallSortedMap<FieldDescriptor> result =
+        new SmallSortedMap<>(fieldAccessorTable.fields.length);
 
     final Descriptor descriptor = fieldAccessorTable.descriptor;
     final List<FieldDescriptor> fields = descriptor.getFields();
@@ -599,8 +600,9 @@ public abstract class GeneratedMessage extends AbstractMessage implements Serial
 
     /** Internal helper which returns a mutable map. */
     private Map<FieldDescriptor, Object> getAllFieldsMutable() {
-      final TreeMap<FieldDescriptor, Object> result = new TreeMap<>();
       final FieldAccessorTable fieldAccessorTable = internalGetFieldAccessorTable();
+      final SmallSortedMap<FieldDescriptor> result =
+          new SmallSortedMap<>(fieldAccessorTable.fields.length);
       final Descriptor descriptor = fieldAccessorTable.descriptor;
       final List<FieldDescriptor> fields = descriptor.getFields();
 
