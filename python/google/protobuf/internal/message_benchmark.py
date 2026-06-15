@@ -33,6 +33,19 @@ def benchmark(
 
 
 @benchmark
+def bench_assign_repeated_float(state: google_benchmark.State):
+  arr = make_array(state.range(0)).view(dtype=np.float32)
+  msg = unittest_pb2.TestAllTypes()
+  msg_source = unittest_pb2.TestAllTypes()
+  msg_source.repeated_float.extend(arr)
+  while state:
+    state.pause_timing()
+    msg.Clear()
+    state.resume_timing()
+    msg.repeated_float[:] = msg_source.repeated_float
+
+
+@benchmark
 def bench_extend_int32(state: google_benchmark.State):
   arr = make_array(state.range(0)).view(dtype=np.int32)
   msg = unittest_pb2.TestAllTypes()

@@ -21,6 +21,7 @@ static PyObject* PyUpb_RepeatedCompositeContainer_Append(PyObject* _self,
                                                          PyObject* value);
 static PyObject* PyUpb_RepeatedScalarContainer_Append(PyObject* _self,
                                                       PyObject* value);
+static Py_ssize_t GetDefaultDTypeSize(upb_CType cpp_type);
 
 // Wrapper for a repeated field.
 typedef struct {
@@ -264,6 +265,40 @@ static bool PyUpb_IterInput(PyObject* value, const upb_FieldDef* field,
                             upb_Arena* arena, PyUpb_SizeCb size_cb,
                             PyUpb_ElemCb elem_cb, PyUpb_BulkCb bulk_cb,
                             void* ctx) {
+  // Detect if value is a repeated scalar container of the same field type.
+  PyUpb_ModuleState* state = PyUpb_ModuleState_MaybeGet();
+  if (state != NULL &&
+      Py_TYPE(value) == state->repeated_scalar_container_type) {
+    PyUpb_RepeatedContainer* other = (PyUpb_RepeatedContainer*)value;
+    const upb_FieldDef* other_f = PyUpb_RepeatedContainer_GetField(other);
+    if (upb_FieldDef_CType(other_f) == upb_FieldDef_CType(field)) {
+      Py_ssize_t itemsize = GetDefaultDTypeSize(upb_FieldDef_CType(field));
+      if (itemsize > 0) {
+        upb_Array* arr = PyUpb_RepeatedContainer_GetIfReified(other);
+        size_t count = arr ? upb_Array_Size(arr) : 0;
+        if (count == 0) {
+          return bulk_cb(NULL, 0, 0, ctx);
+        }
+        const void* data = upb_Array_DataPtr(arr);
+        if (upb_FieldDef_CType(field) == kUpb_CType_Enum &&
+            upb_FieldDef_EnumSubDef(other_f) !=
+                upb_FieldDef_EnumSubDef(field)) {
+          const upb_EnumDef* e = upb_FieldDef_EnumSubDef(field);
+          if (upb_EnumDef_IsClosed(e)) {
+            const int32_t* i32 = (const int32_t*)data;
+            for (Py_ssize_t i = 0; i < (Py_ssize_t)count; i++) {
+              if (!upb_EnumDef_CheckNumber(e, i32[i])) {
+                PyErr_Format(PyExc_ValueError, "invalid enumerator %d",
+                             (int)i32[i]);
+                return false;
+              }
+            }
+          }
+        }
+        return bulk_cb(data, count, itemsize, ctx);
+      }
+    }
+  }
 #if PyUpb_SUPPORT_BUFFER_VIEW
   Py_buffer view;
   if (PyObject_GetBuffer(value, &view, PyBUF_RECORDS_RO) == 0) {
@@ -316,8 +351,6 @@ static bool PyUpb_IterInput(PyObject* value, const upb_FieldDef* field,
   } else {
     PyErr_Clear();
   }
-#else
-  (void)bulk_cb;
 #endif
   PyObject* iter = NULL;
   PyObject* materialized = PySequence_Fast(value, "must assign iterable");
@@ -1140,55 +1173,48 @@ char* GetDefaultDTypeStr(upb_CType cpp_type) {
   return NULL;
 }
 
+// Returns the size in bytes of the given C type. Returns 0 if the type is
+// not a scalar type.
+static Py_ssize_t GetDefaultDTypeSize(upb_CType cpp_type) {
+  switch (cpp_type) {
+    case kUpb_CType_Float:
+      return sizeof(float);
+    case kUpb_CType_Int32:
+      return sizeof(int32_t);
+    case kUpb_CType_Int64:
+      return sizeof(int64_t);
+    case kUpb_CType_UInt32:
+      return sizeof(uint32_t);
+    case kUpb_CType_UInt64:
+      return sizeof(uint64_t);
+    case kUpb_CType_Double:
+      return sizeof(double);
+    case kUpb_CType_Bool:
+      return sizeof(bool);
+    case kUpb_CType_Enum:
+      return sizeof(int32_t);
+    case kUpb_CType_String:
+    case kUpb_CType_Bytes:
+    case kUpb_CType_Message:
+      return 0;
+  }
+  return 0;
+}
+
 PyObject* CreateArrayFromView(PyObject* _self, PyObject* np_module) {
   PyUpb_RepeatedContainer* self = (PyUpb_RepeatedContainer*)(_self);
   upb_Array* arr = PyUpb_RepeatedContainer_GetIfReified(self);
   size_t size = arr ? upb_Array_Size(arr) : 0;
   const upb_FieldDef* f = PyUpb_RepeatedContainer_GetField(self);
-  Py_ssize_t out_buffer_size_bytes;
   const char* out_dtype = GetDefaultDTypeStr(upb_FieldDef_CType(f));
-  switch (upb_FieldDef_CType(f)) {
-    case kUpb_CType_Float: {
-      out_buffer_size_bytes = sizeof(float) * size;
-      break;
-    }
-    case kUpb_CType_Int32: {
-      out_buffer_size_bytes = 4 * size;
-      break;
-    }
-    case kUpb_CType_Int64: {
-      out_buffer_size_bytes = 8 * size;
-      break;
-    }
-    case kUpb_CType_UInt32: {
-      out_buffer_size_bytes = 4 * size;
-      break;
-    }
-    case kUpb_CType_UInt64: {
-      out_buffer_size_bytes = 8 * size;
-      break;
-    }
-    case kUpb_CType_Double: {
-      out_buffer_size_bytes = sizeof(double) * size;
-      break;
-    }
-    case kUpb_CType_Bool: {
-      out_buffer_size_bytes = sizeof(bool) * size;
-      break;
-    }
-    case kUpb_CType_Enum: {
-      out_buffer_size_bytes = 4 * size;
-      break;
-    }
-    case kUpb_CType_Message:
-    case kUpb_CType_Bytes:
-    case kUpb_CType_String: {
-      PyErr_Format(PyExc_SystemError,
-                   "Code should never reach here: cpp type "
-                   "should not be message nor string in CreateArrayFromView.");
-      return NULL;
-    }
+  const Py_ssize_t item_size = GetDefaultDTypeSize(upb_FieldDef_CType(f));
+  if (item_size == 0) {
+    PyErr_Format(PyExc_SystemError,
+                 "Code should never reach here: cpp type "
+                 "should not be message nor string in CreateArrayFromView.");
+    return NULL;
   }
+  const Py_ssize_t out_buffer_size_bytes = item_size * size;
   if (out_buffer_size_bytes == 0) {
     return PyObject_CallMethod(np_module, "empty", "is", 0, out_dtype);
   }
@@ -1233,6 +1259,104 @@ PyObject* ConstructArrayByIteration(PyObject* _self, PyObject* np_module) {
   }
   return nparray;
 }
+#if PyUpb_SUPPORT_BUFFER_VIEW
+
+// Returns the memory view format of the given C type. Returns 0 if the type
+// is not a scalar type.
+static char GetBufferViewFormat(upb_CType cpp_type) {
+  switch (cpp_type) {
+    case kUpb_CType_Float:
+      return 'f';
+    case kUpb_CType_Int32:
+      return 'i';
+    case kUpb_CType_Int64:
+      return 'q';
+    case kUpb_CType_UInt32:
+      return 'I';
+    case kUpb_CType_UInt64:
+      return 'Q';
+    case kUpb_CType_Double:
+      return 'd';
+    case kUpb_CType_Bool:
+      return '?';
+    case kUpb_CType_Enum:
+      return 'i';
+    case kUpb_CType_String:
+    case kUpb_CType_Bytes:
+    case kUpb_CType_Message:
+      return 0;
+  }
+  return 0;
+}
+
+typedef struct {
+  Py_ssize_t shape[1];
+  Py_ssize_t strides[1];
+  char format[2];
+} TypedBufferState;
+
+// Returns a copy of the repeated container's data to prevent self assignment
+// problems.
+int PyUpb_RepeatedContainer_GetBuffer(PyObject* _self, Py_buffer* view,
+                                      int flags) {
+  PyUpb_RepeatedContainer* self = (PyUpb_RepeatedContainer*)(_self);
+  const upb_FieldDef* f = PyUpb_RepeatedContainer_GetField(self);
+  upb_CType c_type = upb_FieldDef_CType(f);
+  char format = GetBufferViewFormat(c_type);
+  if (format == 0) {
+    PyErr_SetString(PyExc_TypeError,
+                    "Cannot get buffer view for non-scalar type");
+    return -1;
+  }
+  upb_Array* arr = PyUpb_RepeatedContainer_GetIfReified(self);
+  size_t size = arr ? upb_Array_Size(arr) : 0;
+  const Py_ssize_t item_size = GetDefaultDTypeSize(c_type);
+  const Py_ssize_t out_buffer_size_bytes = item_size * size;
+  const void* data_ptr =
+      out_buffer_size_bytes > 0 ? upb_Array_DataPtr(arr) : NULL;
+
+  TypedBufferState* state =
+      PyMem_Malloc(sizeof(TypedBufferState) + out_buffer_size_bytes);
+  if (state == NULL) {
+    return -1;
+  }
+  void* out_buf = state + 1;
+  if (PyBuffer_FillInfo(view, _self, out_buf, out_buffer_size_bytes,
+                        /*readonly=*/0, flags) != 0) {
+    PyMem_Free(state);
+    return -1;
+  };
+  if (data_ptr != NULL) {
+    memcpy(out_buf, data_ptr, out_buffer_size_bytes);
+  }
+  state->shape[0] = size;
+  state->strides[0] = item_size;
+  state->format[0] = format;
+  state->format[1] = '\0';
+
+  view->internal = state;
+  view->itemsize = item_size;
+  if (flags & PyBUF_FORMAT) {
+    view->format = state->format;
+  }
+  if (flags & PyBUF_ND) {
+    view->ndim = 1;
+    view->shape = state->shape;
+  }
+  if (flags & PyBUF_STRIDES) {
+    view->strides = state->strides;
+  }
+  return 0;
+}
+
+void PyUpb_RepeatedContainer_ReleaseBuffer(PyObject* _self, Py_buffer* view) {
+  if (view->internal != NULL) {
+    PyMem_Free(view->internal);
+    view->internal = NULL;
+  }
+}
+
+#endif
 
 static PyObject* PyUpb_RepeatedScalarContainer_AsNpArray(PyObject* _self,
                                                          PyObject* args,
@@ -1346,6 +1470,10 @@ static PyType_Slot PyUpb_RepeatedScalarContainer_Slots[] = {
     {Py_mp_ass_subscript, PyUpb_RepeatedContainer_AssignSubscript},
     {Py_tp_richcompare, PyUpb_RepeatedContainer_RichCompare},
     {Py_tp_hash, PyObject_HashNotImplemented},
+#if PyUpb_SUPPORT_BUFFER_VIEW
+    {Py_bf_getbuffer, PyUpb_RepeatedContainer_GetBuffer},
+    {Py_bf_releasebuffer, PyUpb_RepeatedContainer_ReleaseBuffer},
+#endif
     {0, NULL}};
 
 static PyType_Spec PyUpb_RepeatedScalarContainer_Spec = {

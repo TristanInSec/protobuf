@@ -220,6 +220,19 @@ class NumpyIntProtoTest(unittest.TestCase):
     with self.assertRaises(TypeError):
       message.optional_int64 = np_22_float_array
 
+  def testRepeatedFieldSelfSliceAssignment(self):
+    msg = unittest_pb2.NestedTestAllTypes()
+    msg.payload.repeated_int32[:] = np.arange(4, dtype=np.int32)
+    msg.payload.repeated_int32[:] = np.asarray(msg.payload.repeated_int32)
+    self.assertEqual([0, 1, 2, 3], msg.payload.repeated_int32)
+
+  def testNumpyArrayIsMutableCopy(self):
+    msg = unittest_pb2.NestedTestAllTypes()
+    msg.payload.repeated_int32[:] = np.arange(4, dtype=np.int32)
+    arr = np.asarray(msg.payload.repeated_int32)
+    arr[0] = 100
+    self.assertEqual([0, 1, 2, 3], msg.payload.repeated_int32)
+    np.testing.assert_equal([100, 1, 2, 3], arr)
 
 @testing_refleaks.TestCase
 class NumpyFloatProtoTest(unittest.TestCase):

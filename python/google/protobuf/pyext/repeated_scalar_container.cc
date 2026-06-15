@@ -10,9 +10,9 @@
 
 #include "google/protobuf/pyext/repeated_scalar_container.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
@@ -148,7 +148,8 @@ bool CallWithSpanImpl(PyObject* value, const FieldDescriptor* field_descriptor,
         valid_format = false;
       }
       if (valid_format) {
-        bool ok = func(absl::MakeSpan(static_cast<const T*>(view.buf), size));
+        bool ok = std::forward<Func>(func)(
+            absl::MakeSpan(static_cast<const T*>(view.buf), size));
         PyBuffer_Release(&view);
         return ok;
       }
@@ -220,7 +221,7 @@ bool CallWithSpanImpl(PyObject* value, const FieldDescriptor* field_descriptor,
   if (PyErr_Occurred()) {
     PyErr_Fetch(&err_type, &err_value, &err_traceback);
   }
-  bool result = func(
+  bool result = std::forward<Func>(func)(
       absl::MakeSpan(reinterpret_cast<const T*>(values.data()), values.size()));
   if (err_type != nullptr) {
     if (!result) {
@@ -233,13 +234,13 @@ bool CallWithSpanImpl(PyObject* value, const FieldDescriptor* field_descriptor,
   return result;
 }
 
-template <typename F>
+template <typename Func>
 bool CallWithSpan(const FieldDescriptor* field_descriptor, PyObject* value,
-                  F&& op) {
+                  Func&& func) {
   switch (field_descriptor->cpp_type()) {
     case FieldDescriptor::CPPTYPE_INT32:
       return CallWithSpanImpl<int32_t>(value, field_descriptor,
-                                       std::forward<F>(op));
+                                       std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_ENUM:
       if (field_descriptor->legacy_enum_field_treated_as_closed()) {
         return CallWithSpanImpl<int32_t>(
@@ -255,7 +256,7 @@ bool CallWithSpan(const FieldDescriptor* field_descriptor, PyObject* value,
               }
               if (failed_index != values.size()) {
                 auto valid_values = values.subspan(0, failed_index);
-                bool result = std::forward<F>(op)(valid_values);
+                bool result = std::forward<Func>(func)(valid_values);
                 if (result) {
                   PyErr_Format(
                       PyExc_ValueError, "Unknown enum value: %d at index %d",
@@ -263,33 +264,33 @@ bool CallWithSpan(const FieldDescriptor* field_descriptor, PyObject* value,
                 }
                 return false;
               } else {
-                return std::forward<F>(op)(values);
+                return std::forward<Func>(func)(values);
               }
             });
       }
       return CallWithSpanImpl<int32_t>(value, field_descriptor,
-                                       std::forward<F>(op));
+                                       std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_INT64:
       return CallWithSpanImpl<int64_t>(value, field_descriptor,
-                                       std::forward<F>(op));
+                                       std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_UINT32:
       return CallWithSpanImpl<uint32_t>(value, field_descriptor,
-                                        std::forward<F>(op));
+                                        std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_UINT64:
       return CallWithSpanImpl<uint64_t>(value, field_descriptor,
-                                        std::forward<F>(op));
+                                        std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_FLOAT:
       return CallWithSpanImpl<float>(value, field_descriptor,
-                                     std::forward<F>(op));
+                                     std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_DOUBLE:
       return CallWithSpanImpl<double>(value, field_descriptor,
-                                      std::forward<F>(op));
+                                      std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_BOOL:
       return CallWithSpanImpl<uint8_t>(value, field_descriptor,
-                                       std::forward<F>(op));
+                                       std::forward<Func>(func));
     case FieldDescriptor::CPPTYPE_STRING:
       return CallWithSpanImpl<absl::string_view>(value, field_descriptor,
-                                                 std::forward<F>(op));
+                                                 std::forward<Func>(func));
     default:
       PyErr_Format(PyExc_SystemError,
                    "CallWithSpan on a field of unknown type %d",
@@ -434,7 +435,7 @@ static int AssignItem(PyObject* pself, Py_ssize_t index_zd, PyObject* arg) {
   return 0;
 }
 
-static PyObject* Item(PyObject* pself, Py_ssize_t index) {
+static PyObject* Item(PyObject* pself, Py_ssize_t index_zd) {
   RepeatedScalarContainer* self =
       reinterpret_cast<RepeatedScalarContainer*>(pself);
 
@@ -443,13 +444,14 @@ static PyObject* Item(PyObject* pself, Py_ssize_t index) {
   const Reflection* reflection = message->GetReflection();
 
   int field_size = reflection->FieldSize(*message, field_descriptor);
-  if (index < 0) {
-    index = field_size + index;
+  if (index_zd < 0) {
+    index_zd = field_size + index_zd;
   }
-  if (index < 0 || index >= field_size) {
-    PyErr_Format(PyExc_IndexError, "list index (%zd) out of range", index);
+  if (index_zd < 0 || index_zd >= field_size) {
+    PyErr_Format(PyExc_IndexError, "list index (%zd) out of range", index_zd);
     return nullptr;
   }
+  int index = static_cast<int>(index_zd);
 
   PyObject* result = nullptr;
   switch (field_descriptor->cpp_type()) {
@@ -898,33 +900,6 @@ PyObject* NpArrayAsType(PyObject* nparray, PyObject* dtype_requested,
                        keywords.get());
 }
 
-// Takes in an iterable[str], and returns the length (in bytes) of the
-// largest str in the iterable.
-Py_ssize_t CalculateMaxLengthOfStrObjects(PyObject* pself) {
-  ScopedPyObjectPtr iter(PyObject_GetIter(pself));
-  if (iter.get() == nullptr) {
-    PyErr_SetString(PyExc_TypeError, "Unable to get an iterator.");
-    return -1;
-  }
-  ScopedPyObjectPtr next;
-
-  // Default to 1 since empty byte arrays are expected to be represented with
-  // length of 1.
-  Py_ssize_t max_length_of_str = 1;
-  while (next.reset(PyIter_Next(iter.get())) != nullptr) {
-    Py_ssize_t length_of_str = 0;
-    PyUnicode_AsUTF8AndSize(next.get(), &length_of_str);
-    // Previous statement has some basic error checking, so check if
-    // an error occurred via PyErr_Occurred().
-    if (PyErr_Occurred()) {
-      return -1;
-    }
-
-    max_length_of_str = std::max<Py_ssize_t>(length_of_str, max_length_of_str);
-  }
-  return max_length_of_str;
-}
-
 // Note: Returns a new reference.
 PyObject* ConstructArrayByIteration(PyObject* pself, PyObject* np_module) {
   Py_ssize_t array_length = Len(pself);
@@ -967,46 +942,12 @@ std::string GetDefaultDTypeStr(FieldDescriptor::CppType cpp_type) {
 PyObject* CreateArrayFromView(PyObject* pself, PyObject* np_module) {
   RepeatedScalarContainer* self =
       reinterpret_cast<RepeatedScalarContainer*>(pself);
-  const Message* message = self->parent->message;
   const FieldDescriptor* field_descriptor = self->parent_field_descriptor;
-  const Reflection* reflection = message->GetReflection();
+  ScopedPyObjectPtr view(PyMemoryView_FromObject(pself));
+  if (view.get() == nullptr) {
+    return nullptr;
+  }
   std::string out_dtype = GetDefaultDTypeStr(field_descriptor->cpp_type());
-  const void* out_ptr;
-  Py_ssize_t out_buffer_size_bytes;
-
-  switch (field_descriptor->cpp_type()) {
-#define HANDLE_TYPE(TYPE, type)                                         \
-  case FieldDescriptor::CPPTYPE_##TYPE: {                               \
-    const auto& rf =                                                    \
-        reflection->GetRepeatedField<type>(*message, field_descriptor); \
-    out_ptr = reinterpret_cast<const void*>(rf.data());                 \
-    out_buffer_size_bytes = static_cast<Py_ssize_t>(sizeof(type)) *     \
-                            static_cast<Py_ssize_t>(rf.size());         \
-    break;                                                              \
-  }
-    HANDLE_TYPE(FLOAT, float)
-    HANDLE_TYPE(INT32, int)
-    HANDLE_TYPE(INT64, int64_t)
-    HANDLE_TYPE(UINT32, uint32_t)
-    HANDLE_TYPE(UINT64, uint64_t)
-    HANDLE_TYPE(DOUBLE, double)
-    HANDLE_TYPE(BOOL, bool)
-    HANDLE_TYPE(ENUM, int32_t)
-#undef HANDLE_TYPE
-    case FieldDescriptor::CPPTYPE_MESSAGE:
-    case FieldDescriptor::CPPTYPE_STRING: {
-      PyErr_Format(PyExc_SystemError,
-                   "Code should never reach here: cpp type should never be "
-                   "string nor message in GetDTypeAndBuffer().");
-      return nullptr;
-    }
-  }
-  if (out_buffer_size_bytes == 0) {
-    return PyObject_CallMethod(np_module, "empty", "is", 0, out_dtype.c_str());
-  }
-  ScopedPyObjectPtr view(PyMemoryView_FromMemory(
-      const_cast<char*>(reinterpret_cast<const char*>(out_ptr)),
-      out_buffer_size_bytes, PyBUF_READ));
   return PyObject_CallMethod(np_module, "frombuffer", "Os", view.as_pyobject(),
                              out_dtype.c_str());
 }
@@ -1067,8 +1008,8 @@ PyObject* AsNpArray(PyObject* pself, PyObject* args, PyObject* kwargs) {
   if (nparray_nocopy.get() == nullptr) {
     return nullptr;
   }
-  // Return using astype(). This will copy.
-  return NpArrayAsType(nparray_nocopy.as_pyobject(), dtype_requested, true);
+  // Return using astype(). This will not make a second copy if dtype matches.
+  return NpArrayAsType(nparray_nocopy.as_pyobject(), dtype_requested, false);
 }
 
 PyObject* Reduce(PyObject* unused_self, PyObject* unused_other) {
@@ -1244,6 +1185,120 @@ static void Dealloc(PyObject* pself) {
   Py_TYPE(pself)->tp_free(pself);
 }
 
+struct TypedBufferState {
+  void* buf;
+  Py_ssize_t shape[1];
+  Py_ssize_t strides[1];
+  char format[2];
+};
+
+static int GetBuffer(PyObject* pself, Py_buffer* view, int flags) {
+  if (view == nullptr) {
+    PyErr_SetString(PyExc_BufferError, "view cannot be NULL");
+    return -1;
+  }
+
+  RepeatedScalarContainer* self =
+      reinterpret_cast<RepeatedScalarContainer*>(pself);
+  const Message* message = self->parent->message;
+  const FieldDescriptor* field_descriptor = self->parent_field_descriptor;
+  const Reflection* reflection = message->GetReflection();
+
+  const void* out_ptr = nullptr;
+  size_t out_buffer_size_bytes = 0;
+  Py_ssize_t item_size = 0;
+  Py_ssize_t num_elements = 0;
+  char fmt = '\0';
+
+  auto handle_type = [](FieldDescriptor::CppType cpp_type, auto func) -> bool {
+    switch (cpp_type) {
+      case FieldDescriptor::CPPTYPE_FLOAT:
+        return func(float{}, 'f');
+      case FieldDescriptor::CPPTYPE_INT32:
+        return func(int32_t{}, 'i');
+      case FieldDescriptor::CPPTYPE_INT64:
+        return func(int64_t{}, 'q');
+      case FieldDescriptor::CPPTYPE_UINT32:
+        return func(uint32_t{}, 'I');
+      case FieldDescriptor::CPPTYPE_UINT64:
+        return func(uint64_t{}, 'Q');
+      case FieldDescriptor::CPPTYPE_DOUBLE:
+        return func(double{}, 'd');
+      case FieldDescriptor::CPPTYPE_BOOL:
+        return func(bool{}, '?');
+      case FieldDescriptor::CPPTYPE_ENUM:
+        return func(int32_t{}, 'i');
+      default:
+        return false;
+    }
+  };
+
+  if (!handle_type(field_descriptor->cpp_type(), [&](auto type, char format) {
+        using ScalarType = std::decay_t<decltype(type)>;
+        const auto& rf = reflection->GetRepeatedField<ScalarType>(
+            *message, field_descriptor);
+        out_ptr = reinterpret_cast<const void*>(rf.data());
+        item_size = sizeof(ScalarType);
+        num_elements = rf.size();
+        out_buffer_size_bytes = static_cast<size_t>(item_size * num_elements);
+        fmt = format;
+        return true;
+      })) {
+    PyErr_Format(PyExc_BufferError,
+                 "repeated field does not support buffer interface.");
+    return -1;
+  }
+
+  TypedBufferState* state = reinterpret_cast<TypedBufferState*>(
+      PyMem_Malloc(sizeof(TypedBufferState) + out_buffer_size_bytes));
+  if (state == nullptr) {
+    PyErr_NoMemory();
+    return -1;
+  }
+  state->buf = state + 1;
+
+  if (PyBuffer_FillInfo(view, pself, state->buf,
+                        static_cast<Py_ssize_t>(out_buffer_size_bytes),
+                        /*readonly=*/0, flags) < 0) {
+    PyMem_Free(state);
+    return -1;
+  }
+
+  if (out_buffer_size_bytes > 0) {
+    std::memcpy(state->buf, out_ptr, out_buffer_size_bytes);
+  }
+
+  view->internal = state;
+  view->itemsize = item_size;
+  if (flags & PyBUF_FORMAT) {
+    state->format[0] = fmt;
+    state->format[1] = '\0';
+    view->format = state->format;
+  }
+  if (flags & PyBUF_ND) {
+    view->ndim = 1;
+    state->shape[0] = num_elements;
+    view->shape = state->shape;
+  }
+  if (flags & PyBUF_STRIDES) {
+    state->strides[0] = item_size;
+    view->strides = state->strides;
+  }
+  return 0;
+}
+
+static void ReleaseBuffer(PyObject* pself, Py_buffer* view) {
+  if (view->internal != nullptr) {
+    PyMem_Free(view->internal);
+    view->internal = nullptr;
+  }
+}
+
+static PyBufferProcs BufferProcs = {
+    GetBuffer,
+    ReleaseBuffer,
+};
+
 static PySequenceMethods SqMethods = {
     Len,       /* sq_length */
     nullptr,   /* sq_concat */
@@ -1298,19 +1353,19 @@ PyTypeObject RepeatedScalarContainer_Type = {
 #else
     nullptr,  //  tp_print
 #endif
-    nullptr,                                //  tp_getattr
-    nullptr,                                //  tp_setattr
-    nullptr,                                //  tp_compare
-    repeated_scalar_container::ToStr,       //  tp_repr
-    nullptr,                                //  tp_as_number
-    &repeated_scalar_container::SqMethods,  //  tp_as_sequence
-    &repeated_scalar_container::MpMethods,  //  tp_as_mapping
-    PyObject_HashNotImplemented,            //  tp_hash
-    nullptr,                                //  tp_call
-    nullptr,                                //  tp_str
-    nullptr,                                //  tp_getattro
-    nullptr,                                //  tp_setattro
-    nullptr,                                //  tp_as_buffer
+    nullptr,                                  //  tp_getattr
+    nullptr,                                  //  tp_setattr
+    nullptr,                                  //  tp_compare
+    repeated_scalar_container::ToStr,         //  tp_repr
+    nullptr,                                  //  tp_as_number
+    &repeated_scalar_container::SqMethods,    //  tp_as_sequence
+    &repeated_scalar_container::MpMethods,    //  tp_as_mapping
+    PyObject_HashNotImplemented,              //  tp_hash
+    nullptr,                                  //  tp_call
+    nullptr,                                  //  tp_str
+    nullptr,                                  //  tp_getattro
+    nullptr,                                  //  tp_setattro
+    &repeated_scalar_container::BufferProcs,  //  tp_as_buffer
 #if PY_VERSION_HEX >= 0x030A0000
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_SEQUENCE,  //  tp_flags
 #else
