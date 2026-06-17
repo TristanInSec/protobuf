@@ -2549,6 +2549,11 @@ DescriptorPool::DescriptorPool(const DescriptorPool* underlay)
       enforce_naming_style_(false) {}
 
 DescriptorPool::~DescriptorPool() {
+  if (python_ref_count_.load(std::memory_order_acquire) > 0) {
+    ABSL_LOG(FATAL) << "DescriptorPool destroyed while Python still holds a "
+                       "reference! (python_ref_count_: "
+                    << python_ref_count_.load(std::memory_order_relaxed) << ")";
+  }
   if (mutex_ != nullptr) delete mutex_;
 }
 

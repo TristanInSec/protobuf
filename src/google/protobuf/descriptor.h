@@ -2337,6 +2337,16 @@ class PROTOBUF_EXPORT DescriptorPool {
 #endif
   ~DescriptorPool();
 
+#ifndef SWIG
+  mutable std::atomic<int> python_ref_count_{0};
+  void IncrementPythonRefCount() const {
+    python_ref_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void DecrementPythonRefCount() const {
+    python_ref_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
+#endif
+
   // Get a pointer to the generated pool.  Generated protocol message classes
   // which are compiled into the binary will allocate their descriptors in
   // this pool.  Do not add your own descriptors to this pool.

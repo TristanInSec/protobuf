@@ -133,10 +133,60 @@ auto ReprDynamicMessage(int value) {
   // classes, but they always form a reference cycle with their Python
   // MessageFactory.
   // So it is necessary to run the garbage collector.
+  py_pool = py::none();
   py::exec("import gc; gc.collect()");
   // Now the Python MessageFactory has been deleted, and it is safe to destroy
   // the C++ DescriptorPool.
 
+  return result_string;
+}
+
+auto ReprDynamicMessageSharedPool(int value) {
+  const PyProto_API* api = GetProtoApi();
+
+  auto pool = std::make_shared<DescriptorPool>(
+      DescriptorPool::internal_generated_database());
+
+  // Create the Python DescriptorPool using shared_ptr...
+  auto py_pool =
+      py::reinterpret_steal<py::object>(api->DescriptorPool_FromPool(pool));
+  if (!py_pool) {
+    throw py::error_already_set();
+  }
+
+  std::string result_string;
+  {
+    const Descriptor* descriptor =
+        pool->FindMessageTypeByName("proto2_unittest.TestAllTypes");
+    if (!descriptor) {
+      throw std::runtime_error("Failed to find file descriptor");
+    }
+    DynamicMessageFactory factory(pool.get());
+    const Message* prototype = factory.GetPrototype(descriptor);
+    if (!prototype) {
+      throw std::runtime_error("Failed to get prototype for descriptor");
+    }
+    std::unique_ptr<Message> msg(prototype->New());
+    if (!msg) {
+      throw std::runtime_error("Failed to create message");
+    }
+    msg->GetReflection()->SetInt32(
+        msg.get(), descriptor->FindFieldByName("optional_int32"), value);
+
+    auto py_msg = py::reinterpret_steal<py::object>(
+        api->NewMessageOwnedExternally(msg.get(), nullptr));
+    if (!py_msg) {
+      throw py::error_already_set();
+    }
+    result_string = py::repr(py_msg);
+  }  // msg and factory are safely destroyed here before pool.
+
+  // Now, unlike the previous test, we can safely let the C++ pool handle go out
+  // of scope because py_pool holds a shared_ptr keeping it alive!
+  pool.reset();
+
+  py_pool = py::none();
+  py::exec("import gc; gc.collect()");
   return result_string;
 }
 
@@ -198,6 +248,7 @@ PYBIND11_MODULE(proto_api_test_ext, m) {
   m.def("get_const_message", &GetConstMessage);
   m.def("set_message_field_with_mutator", &SetMessageFieldWithMutator);
   m.def("repr_dynamic_message", &ReprDynamicMessage);
+  m.def("repr_dynamic_message_shared_pool", &ReprDynamicMessageSharedPool);
   m.def("create_dynamic_pool_message", &CreateDynamicPoolMessage);
 }
 
